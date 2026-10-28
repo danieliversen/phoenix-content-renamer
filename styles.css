@@ -1,0 +1,14 @@
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --ct:#111827;--cs:#6b7280;--cx:#9ca3af;
+  --bp:#fff;--bs:#f9fafb;--bt:#f3f4f6;
+  --bmd:rgba(0,0,0,0.12);--bsm:rgba(0,0,0,0.06);
+  --ff:system-ui,-apple-system,'Segoe UI',sans-serif;
+  --fm:'SF Mono','Cascadia Code',ui-monospace,monospace;
+}
+html,body,#root{height:100%}
+body{font-family:var(--ff);background:var(--bt);color:var(--ct)}
+input,select,textarea,button{font-family:inherit}
+input:focus,select:focus,textarea:focus{outline:none}
+::-webkit-scrollbar{width:5px}
+::-webkit-scrollbar-thumb{background:rgba(0,0,0,0.15);border-radius:3px}

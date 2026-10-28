@@ -1,0 +1,654 @@
+const { useState, useRef } = React;
+
+/* ── Direct, client-side API endpoints (both support browser CORS) ── */
+const ASANA  = "https://app.asana.com/api/1.0";
+const CLAUDE = "https://api.anthropic.com/v1/messages";
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const SKIP_RE = /strategic\s+(initiatives?|planning)\s*202\d/i;
+
+class Pool {
+  constructor(n=3){this.n=n;this.a=0;this.q=[];}
+  run(fn){
+    return new Promise((res,rej)=>{
+      const go=()=>{this.a++;Promise.resolve(fn()).then(res,rej).finally(()=>{this.a--;this.q.shift()?.();});};
+      this.a<this.n?go():this.q.push(go);
+    });
+  }
+}
+
+/* Asana headers */
+const aHdrs = t => ({ Authorization:`Bearer ${t}`, Accept:"application/json", "Content-Type":"application/json" });
+
+async function aGet(path, token, pool, params={}) {
+  const all=[]; let off=null;
+  do {
+    const qs=new URLSearchParams({limit:"100",...params});
+    if(off) qs.set("offset",off);
+    const data=await pool.run(async()=>{
+      for(;;){
+        const r=await fetch(`${ASANA}${path}?${qs}`,{headers:aHdrs(token)});
+        if(r.status===429){await sleep(Math.max(+(r.headers.get("Retry-After")||15),5)*1000);continue;}
+        if(!r.ok){const b=await r.json().catch(()=>({}));throw new Error(b.errors?.[0]?.message||`HTTP ${r.status}`);}
+        return r.json();
+      }
+    });
+    all.push(...(data.data??[]));
+    off=data.next_page?.offset??null;
+  } while(off);
+  return all;
+}
+
+async function aPut(path, token, pool, body) {
+  return pool.run(async()=>{
+    for(;;){
+      const r=await fetch(`${ASANA}${path}`,{method:"PUT",headers:aHdrs(token),body:JSON.stringify({data:body})});
+      if(r.status===429){await sleep(Math.max(+(r.headers.get("Retry-After")||15),5)*1000);continue;}
+      if(!r.ok){const b=await r.json().catch(()=>({}));throw new Error(b.errors?.[0]?.message||`HTTP ${r.status}`);}
+      return r.json();
+    }
+  });
+}
+
+function mkGoalTree(flat) {
+  const m={};
+  flat.forEach(g=>(m[g.gid]={...g,resource_type:"goal",children:[]}));
+  const roots=[];
+  flat.forEach(g=>{
+    const pid=g.parent_goal?.gid;
+    pid&&m[pid]?m[pid].children.push(m[g.gid]):roots.push(m[g.gid]);
+  });
+  return roots;
+}
+
+/* ── Row component ─────────────────────────────────────────────────────── */
+const ICO={goal:"ti-target",portfolio:"ti-folder",project:"ti-layout-kanban"};
+const ICOCLR={goal:"#f59e0b",portfolio:"#3b82f6",project:"var(--cx)"};
+
+function Row({item,exp,onToggle,sugg,edits,onEdit,res}){
+  const type=item.resource_type||"project";
+  const kids=(item.children?.length??0)>0;
+  const open=exp[item.gid];
+  const s=sugg[item.gid],e=edits[item.gid];
+  const eff=e||s;
+  const st=res[item.gid];
+
+  return (
+    <div>
+      {/* Row itself */}
+      <div style={{
+        display:"flex",alignItems:"stretch",
+        borderBottom:"0.5px solid var(--bsm)",
+        background:st==="success"?"rgba(34,197,94,0.05)":st==="error"?"rgba(239,68,68,0.05)":undefined,
+        borderLeft:st==="success"?"2px solid #22c55e":st==="error"?"2px solid #ef4444":"2px solid transparent",
+        minHeight:40,
+      }}>
+        {/* Toggle */}
+        <button onClick={()=>kids&&onToggle(item.gid)} style={{
+          flexShrink:0,width:30,display:"flex",alignItems:"center",justifyContent:"center",
+          background:"none",border:"none",cursor:kids?"pointer":"default",color:"var(--cx)",paddingTop:2,
+        }}>
+          {kids
+            ? <i className={`ti ${open?"ti-chevron-down":"ti-chevron-right"}`} style={{fontSize:11,color:"var(--cs)"}}/>
+            : <span style={{width:6,height:6,borderRadius:"50%",background:"var(--bmd)",display:"inline-block"}}/>}
+        </button>
+
+        {/* Icon */}
+        <div style={{flexShrink:0,width:18,display:"flex",alignItems:"center",marginRight:8}}>
+          <i className={`ti ${ICO[type]||"ti-file"}`} style={{fontSize:13,color:ICOCLR[type]||"var(--cx)"}}/>
+        </div>
+
+        {/* Two-column content */}
+        <div style={{flex:1,display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,padding:"8px 8px 8px 0",minWidth:0}}>
+          {/* Current */}
+          <div style={{minWidth:0}}>
+            <p style={{fontSize:12,fontWeight:500,color:"var(--ct)",margin:0,lineHeight:1.4,wordBreak:"break-word"}}>
+              {item.name}
+            </p>
+            {item.notes&&<p style={{fontSize:10,color:"var(--cx)",margin:"2px 0 0",lineHeight:1.5,
+              display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical",overflow:"hidden"}}>
+              {item.notes}
+            </p>}
+          </div>
+          {/* New */}
+          <div style={{minWidth:0,display:"flex",flexDirection:"column",gap:3}}>
+            <input style={{
+              width:"100%",fontSize:12,padding:"3px 7px",borderRadius:5,boxSizing:"border-box",
+              border:eff?.name?"0.5px solid #a5b4fc":"0.5px solid var(--bmd)",
+              background:eff?.name?"rgba(165,180,252,0.07)":"var(--bp)",color:"var(--ct)",
+            }}
+              value={eff?.name??""}
+              onChange={ev=>onEdit(item.gid,{...(eff||{}),name:ev.target.value})}
+              placeholder={s?"":"generate names first…"}/>
+            {item.notes&&<textarea rows={2} style={{
+              width:"100%",fontSize:10,padding:"3px 7px",borderRadius:5,resize:"none",boxSizing:"border-box",
+              border:"0.5px solid var(--bmd)",background:"var(--bp)",color:"var(--ct)",lineHeight:1.5,
+            }}
+              value={eff?.description??""}
+              onChange={ev=>onEdit(item.gid,{...(eff||{}),description:ev.target.value})}
+              placeholder="new description…"/>}
+          </div>
+        </div>
+
+        {/* Status */}
+        <div style={{flexShrink:0,width:22,display:"flex",alignItems:"center",justifyContent:"center"}}>
+          {st==="success"&&<i className="ti ti-check" style={{color:"#22c55e",fontSize:12}}/>}
+          {st==="error"&&<i className="ti ti-x" style={{color:"#ef4444",fontSize:12}}/>}
+        </div>
+      </div>
+
+      {/* Children — indented with a tree line */}
+      {kids&&open&&(
+        <div style={{marginLeft:24,borderLeft:"1.5px solid var(--bsm)"}}>
+          {item.children.map(c=>(
+            <Row key={c.gid} item={c} exp={exp} onToggle={onToggle}
+              sugg={sugg} edits={edits} onEdit={onEdit} res={res}/>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ColHdr(){
+  return(
+    <div style={{display:"flex",alignItems:"stretch",background:"var(--bs)",
+      borderBottom:"0.5px solid var(--bmd)",fontSize:9,fontWeight:700,color:"var(--cx)",
+      textTransform:"uppercase",letterSpacing:"0.07em"}}>
+      <div style={{flexShrink:0,width:30}}/><div style={{flexShrink:0,width:18,marginRight:8}}/>
+      <div style={{flex:1,display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,padding:"5px 8px 5px 0"}}>
+        <div>Current</div><div>Suggested / override</div>
+      </div>
+      <div style={{flexShrink:0,width:22}}/>
+    </div>
+  );
+}
+
+/* ── App ─────────────────────────────────────────────────────────────── */
+function App(){
+  const [token,setToken]=useState("");
+  const [claudeKey,setClaudeKey]=useState("");
+  const [workspaces,setWorkspaces]=useState([]);
+  const [wsGid,setWsGid]=useState("");
+  const [showSettings,setShowSettings]=useState(true);
+  const [mode,setMode]=useState("org");
+  const [company,setCompany]=useState("");
+  const [industry,setIndustry]=useState("");
+  const [dept,setDept]=useState("");
+  const [gTree,setGTree]=useState([]);
+  const [pTree,setPTree]=useState([]);
+  const [flat,setFlat]=useState({});
+  const [sugg,setSugg]=useState({});
+  const [edits,setEdits]=useState({});
+  const [exp,setExp]=useState({});
+  const [res,setRes]=useState({});
+  const [phase,setPhase]=useState("setup");
+  const [prog,setProg]=useState({lbl:"",n:0,of:0});
+  const [log,setLog]=useState([]);
+  const [errMsg,setErrMsg]=useState("");
+  const pool=useRef(new Pool(3)).current;
+
+  const lg=msg=>setLog(l=>[...l.slice(-299),`${new Date().toLocaleTimeString()} ${msg}`]);
+
+  /* ── Connect ─────────────────────────────────────────────────── */
+  async function connect(){
+    setErrMsg("");
+    try{
+      const ws=await aGet("/workspaces",token,pool,{opt_fields:"gid,name"});
+      setWorkspaces(ws);if(ws.length===1)setWsGid(ws[0].gid);
+      setShowSettings(false);setPhase("config");
+      lg(`✓ Connected — ${ws.length} workspace(s)`);
+    }catch(e){setErrMsg(`Connection failed: ${e.message}`);lg(`✗ ${e.message}`);}
+  }
+
+  /* ── Fetch ───────────────────────────────────────────────────── */
+  async function fetchData(){
+    setSugg({});setEdits({});setRes({});setErrMsg("");setPhase("fetching");
+    try{
+      /* Goals */
+      lg("Fetching goals…");
+      const rawG=await aGet("/goals",token,pool,{
+        workspace:wsGid,
+        opt_fields:"gid,name,notes,resource_type,parent_goal.gid,parent_goal.name",
+      });
+      lg(`${rawG.length} goal(s) fetched`);
+      const tree=mkGoalTree(rawG);
+      /* Log hierarchy summary */
+      const rootCount=tree.length;
+      const childCount=rawG.length-rootCount;
+      if(childCount>0) lg(`Goal tree: ${rootCount} root goal(s), ${childCount} sub-goal(s)`);
+      setGTree(tree);
+
+      /* Portfolios — service accounts don't own anything, so scan every workspace
+         member and union their portfolios. Pool keeps it to 3 concurrent requests. */
+      lg("Fetching workspace members to discover all portfolios…");
+      const wsMbrs=await aGet(`/workspaces/${wsGid}/workspace_memberships`,token,pool,{opt_fields:"user.gid"});
+      const memberGids=[...new Set(wsMbrs.map(m=>m.user?.gid).filter(Boolean))];
+      lg(`${memberGids.length} workspace member(s) — querying portfolios for each…`);
+      setProg({lbl:"Scanning portfolios across members…",n:0,of:memberGids.length});
+      const portBuckets=await Promise.all(
+        memberGids.map(async uid=>{
+          const ps=await aGet("/portfolios",token,pool,{workspace:wsGid,owner:uid,opt_fields:"gid,name"}).catch(()=>[]);
+          setProg(pr=>({...pr,n:pr.n+1}));
+          return ps;
+        })
+      );
+      const seenPort=new Set();
+      const rawP=portBuckets.flat().filter(p=>{if(seenPort.has(p.gid))return false;seenPort.add(p.gid);return true;});
+      lg(`${rawP.length} unique portfolio(s) found across all members`);
+      if(rawP.length===0) lg("⚠ Still no portfolios — verify the service account token has workspace read access.");
+      const toGet=rawP.filter(p=>!SKIP_RE.test(p.name));
+      if(rawP.length!==toGet.length) lg(`Skipping ${rawP.length-toGet.length} Strategic Initiatives portfolio(s)`);
+
+      setProg({lbl:"Fetching portfolio items…",n:0,of:toGet.length});
+      const withKids=await Promise.all(toGet.map(async p=>{
+        const ch=await aGet(`/portfolios/${p.gid}/items`,token,pool,{opt_fields:"gid,name,notes,resource_type"});
+        setProg(pr=>({...pr,n:pr.n+1}));
+        const projects=ch.filter(c=>(c.resource_type||"project")==="project");
+        const subPorts=ch.filter(c=>c.resource_type==="portfolio");
+        lg(`"${p.name}": ${projects.length} project(s)${subPorts.length?`, ${subPorts.length} sub-portfolio(s)`:""}`);
+        return{...p,resource_type:"portfolio",children:ch};
+      }));
+      setPTree(withKids);
+
+      /* Flat map for LLM + updates */
+      const f={};
+      rawG.forEach(g=>{f[g.gid]={...g,resource_type:"goal"};});
+      const addF=item=>{
+        f[item.gid]={...item,resource_type:item.resource_type||"project"};
+        item.children?.forEach(addF);
+      };
+      withKids.forEach(addF);
+      setFlat(f);
+
+      /* Expand first level */
+      const initExp={};
+      tree.forEach(g=>{initExp[g.gid]=true;});
+      withKids.forEach(p=>{initExp[p.gid]=true;});
+      setExp(initExp);
+
+      const nProj=withKids.reduce((s,p)=>s+p.children.filter(c=>(c.resource_type||"project")==="project").length,0);
+      lg(`Ready: ${rawG.length} goals · ${withKids.length} portfolios · ${nProj} projects`);
+      setPhase("fetched");
+    }catch(e){setErrMsg(`Fetch failed: ${e.message}`);lg(`✗ ${e.message}`);setPhase("config");}
+  }
+
+  /* ── Generate names ──────────────────────────────────────────── */
+  async function generateNames(){
+    if(!claudeKey){setErrMsg("Enter your Anthropic API key in Settings first.");return;}
+    setPhase("generating");setErrMsg("");
+    lg("Calling Claude to generate names…");
+
+    const items=Object.values(flat).map(i=>({
+      gid:i.gid,type:i.resource_type||"project",name:i.name,
+      ...(i.notes?.trim()?{currentDesc:i.notes.trim().slice(0,300)}:{}),
+      ...(i.parent_goal?.name?{parentGoalName:i.parent_goal.name}:{}),
+    }));
+
+    if(items.length===0){
+      setErrMsg("No content loaded yet — click Fetch Content first.");
+      setPhase("fetched");return;
+    }
+
+    const ctx=mode==="dept"
+      ?`departmental demo for the ${dept} team at ${company} (${industry} industry)`
+      :`company-wide demo for ${company} (${industry} industry)`;
+
+    const mkPrompt=batch=>[
+      `Rename these Asana workspace objects for a ${ctx}.`,"",
+      "Rules:",
+      "1. Preserve the purpose/theme — if original is about intake, keep it about intake; budget→budget; planning→planning",
+      `2. Make names realistic and specific to ${company} / ${industry}${mode==="dept"?` / ${dept} department`:""}`,
+      "3. Goals: check 'parentGoalName' — children must fit logically under their parent goal",
+      "4. Include 'description' ONLY if item already has 'currentDesc'; otherwise omit",
+      "5. Portfolios: name only, no description","6. Match original name length; professional and concise","",
+      `Items: ${JSON.stringify(batch)}`,"",
+      'Return JSON only — no markdown, no explanation: {"<gid>":{"name":"...","description":"..."},...}',
+    ].join("\n");
+
+    const BATCH=40;
+    const all={};
+    let stage="start";
+    try{
+      for(let s=0;s<items.length;s+=BATCH){
+        const batch=items.slice(s,s+BATCH);
+        const tag=`batch ${s/BATCH+1}/${Math.ceil(items.length/BATCH)}`;
+        stage=`${tag} request`;
+        lg(`${tag}: sending ${batch.length} item(s)…`);
+        const r=await fetch(CLAUDE,{
+          method:"POST",
+          headers:{
+            "Content-Type":"application/json",
+            "x-api-key":claudeKey,
+            "anthropic-version":"2023-06-01",
+            "anthropic-dangerous-direct-browser-access":"true",
+          },
+          body:JSON.stringify({
+            model:"claude-haiku-4-5-20251001",max_tokens:16000,
+            system:"You rename Asana workspace objects for demo environments. Return ONLY valid JSON — no markdown, no code fences.",
+            messages:[{role:"user",content:mkPrompt(batch)}],
+          }),
+        });
+        const raw=await r.text();
+        lg(`${tag}: HTTP ${r.status}, ${raw.length} bytes`);
+        console.log(`[generate] ${tag} HTTP ${r.status}`,raw.slice(0,2000));
+        if(!raw.trim())throw new Error(`Empty response body (HTTP ${r.status})`);
+        stage=`${tag} parse API response`;
+        let d;
+        try{d=JSON.parse(raw);}catch(_){throw new Error(`API returned non-JSON (HTTP ${r.status}): ${raw.slice(0,200)}`);}
+        if(!r.ok)throw new Error(d.error?.message||`HTTP ${r.status}`);
+        lg(`${tag}: stop_reason=${d.stop_reason}, output_tokens=${d.usage?.output_tokens}`);
+        if(d.stop_reason==="max_tokens")throw new Error(`${tag}: response truncated at max_tokens — lower BATCH size`);
+        const txt=d.content?.find(b=>b.type==="text")?.text??"";
+        console.log(`[generate] ${tag} model text`,txt);
+        stage=`${tag} parse model JSON`;
+        const clean=txt.replace(/```(?:json)?\n?/g,"").trim();
+        const a=clean.indexOf("{"),z=clean.lastIndexOf("}");
+        if(a<0||z<a)throw new Error(`Model returned no JSON object: ${clean.slice(0,200)||"(empty)"}`);
+        Object.assign(all,JSON.parse(clean.slice(a,z+1)));
+      }
+      setSugg(all);
+      lg(`✓ ${Object.keys(all).length} name(s) generated`);
+      setPhase("review");
+    }catch(e){console.error("[generate] failed at",stage,e);setErrMsg(`Generation failed (${stage}): ${e.message}`);lg(`✗ [${stage}] ${e.message}`);setPhase("fetched");}
+  }
+
+  /* ── Apply changes ───────────────────────────────────────────── */
+  async function applyChanges(only){
+    setPhase("applying");setErrMsg("");
+    if(!only)setRes({});
+    const updates=Object.values(flat)
+      .filter(i=>!only||(i.resource_type||"project")===only)
+      .map(i=>({i,eff:edits[i.gid]||sugg[i.gid]})).filter(u=>u.eff?.name?.trim());
+    setProg({lbl:"Sending updates…",n:0,of:updates.length});
+    lg(`Sending ${updates.length} ${only?only+" ":""}update(s) to Asana…`);
+
+    await Promise.all(updates.map(async({i,eff})=>{
+      const t=i.resource_type||"project";
+      const path=t==="goal"?`/goals/${i.gid}`:t==="portfolio"?`/portfolios/${i.gid}`:`/projects/${i.gid}`;
+      const body={name:eff.name.trim()};
+      if(t!=="portfolio"&&eff.description?.trim()) body.notes=eff.description.trim();
+      try{
+        await aPut(path,token,pool,body);
+        setRes(r=>({...r,[i.gid]:"success"}));lg(`✓ ${eff.name}`);
+      }catch(e){
+        setRes(r=>({...r,[i.gid]:"error"}));lg(`✗ "${i.name}": ${e.message}`);
+      }
+      setProg(p=>({...p,n:p.n+1}));
+    }));
+    lg("All updates sent");setPhase("done");
+  }
+
+  /* ── Derived state ───────────────────────────────────────────── */
+  const busy=["fetching","generating","applying"].includes(phase);
+  const hasData=gTree.length>0||pTree.length>0;
+  const canFetch=!!token&&!!wsGid&&!busy;
+  const canGen=hasData&&!!company&&!!industry&&(mode==="org"||!!dept)&&!!claudeKey&&!busy;
+  const canApply=(phase==="review"||phase==="done")&&!busy;
+
+  const nG=Object.values(flat).filter(i=>i.resource_type==="goal").length;
+  const nP=pTree.length;
+  const nPr=Object.values(flat).filter(i=>(i.resource_type||"project")==="project").length;
+  const nOK=Object.values(res).filter(v=>v==="success").length;
+  const nFail=Object.values(res).filter(v=>v==="error").length;
+
+  const onToggle=gid=>setExp(e=>({...e,[gid]:!e[gid]}));
+  const onEdit=(gid,v)=>setEdits(ed=>({...ed,[gid]:v}));
+  const expandAll=()=>{const e={};Object.keys(flat).forEach(g=>{e[g]=true;});setExp(e);};
+  const collapseAll=()=>setExp({});
+
+  /* ── Styles ──────────────────────────────────────────────────── */
+  const iStyle={width:"100%",boxSizing:"border-box",fontSize:11,padding:"5px 8px",borderRadius:6,
+    border:"0.5px solid var(--bmd)",background:"var(--bp)",color:"var(--ct)"};
+
+  const Btn=({label,onClick,disabled,bg,outline})=>(
+    <button onClick={onClick} disabled={disabled} style={{
+      width:"100%",fontSize:11,fontWeight:600,padding:"8px 0",borderRadius:8,
+      cursor:disabled?"not-allowed":"pointer",opacity:disabled?0.38:1,
+      color:outline?"var(--cs)":"#fff",
+      background:outline?"transparent":disabled?"#9ca3af":bg,
+      border:outline?"0.5px solid var(--bmd)":"none",
+    }}>{label}</button>
+  );
+
+  /* ── Render ──────────────────────────────────────────────────── */
+  return(
+    <div style={{height:"100vh",display:"flex",flexDirection:"column",fontFamily:"var(--ff)",background:"var(--bt)"}}>
+
+      {/* Header */}
+      <div style={{background:"var(--bp)",borderBottom:"0.5px solid var(--bmd)",padding:"9px 14px",
+        display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0,gap:10}}>
+        <div style={{display:"flex",alignItems:"center",gap:9}}>
+          <div style={{width:28,height:28,borderRadius:7,background:"linear-gradient(135deg,#6366f1,#8b5cf6)",
+            display:"flex",alignItems:"center",justifyContent:"center"}}>
+            <i className="ti ti-refresh" style={{fontSize:14,color:"#fff"}}/>
+          </div>
+          <div>
+            <p style={{margin:0,fontSize:13,fontWeight:600,color:"var(--ct)",lineHeight:1.2}}>Asana Demo Renamer</p>
+            <p style={{margin:0,fontSize:9,color:"var(--cx)",lineHeight:1.2}}>Rename goals, portfolios &amp; projects for demos</p>
+          </div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          {hasData&&<div style={{display:"flex",gap:10,fontSize:11,color:"var(--cs)"}}>
+            {nG>0&&<span><i className="ti ti-target" style={{marginRight:3,fontSize:11,color:"#f59e0b"}}/>{nG}</span>}
+            {nP>0&&<span><i className="ti ti-folder" style={{marginRight:3,fontSize:11,color:"#3b82f6"}}/>{nP}</span>}
+            {nPr>0&&<span><i className="ti ti-layout-kanban" style={{marginRight:3,fontSize:11,color:"var(--cx)"}}/>{nPr}</span>}
+            {phase==="done"&&<><span style={{color:"#22c55e",fontWeight:600}}>✓{nOK}</span>
+              {nFail>0&&<span style={{color:"#ef4444",fontWeight:600}}> ✗{nFail}</span>}</>}
+          </div>}
+          <button onClick={()=>setShowSettings(s=>!s)} style={{
+            fontSize:10,padding:"4px 9px",borderRadius:5,cursor:"pointer",fontWeight:500,
+            border:showSettings?"0.5px solid #a5b4fc":"0.5px solid var(--bmd)",
+            background:showSettings?"rgba(165,180,252,0.12)":"transparent",
+            color:showSettings?"#6366f1":"var(--cs)"}}>
+            <i className="ti ti-settings" style={{marginRight:3,fontSize:11}}/>Settings
+          </button>
+        </div>
+      </div>
+
+      {/* Error banner */}
+      {errMsg&&<div style={{background:"rgba(239,68,68,0.07)",borderBottom:"0.5px solid rgba(239,68,68,0.25)",
+        padding:"7px 14px",display:"flex",alignItems:"center",gap:7,flexShrink:0}}>
+        <i className="ti ti-alert-triangle" style={{color:"#ef4444",fontSize:13,flexShrink:0}}/>
+        <span style={{fontSize:11,color:"#b91c1c",flex:1}}>{errMsg}</span>
+        <button onClick={()=>setErrMsg("")} style={{background:"none",border:"none",cursor:"pointer",color:"#ef4444",fontSize:13}}>✕</button>
+      </div>}
+
+      {/* Settings panel */}
+      {showSettings&&<div style={{background:"rgba(99,102,241,0.03)",borderBottom:"0.5px solid rgba(99,102,241,0.18)",
+        padding:"11px 14px",flexShrink:0}}>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,maxWidth:680}}>
+          {/* Asana token */}
+          <div>
+            <p style={{margin:"0 0 5px",fontSize:9,fontWeight:700,color:"#6366f1",textTransform:"uppercase",letterSpacing:"0.06em"}}>
+              Asana Service Account Token
+            </p>
+            <div style={{display:"flex",gap:6}}>
+              <input type="password" value={token} onChange={e=>setToken(e.target.value)}
+                onKeyDown={e=>e.key==="Enter"&&token&&connect()}
+                placeholder="1/XXXXXXXXXXXXXXXX:XXXXXXX…"
+                style={{...iStyle,flex:1,border:"0.5px solid rgba(99,102,241,0.35)"}}/>
+              <button onClick={connect} disabled={!token} style={{
+                background:token?"#6366f1":"#9ca3af",color:"#fff",border:"none",
+                padding:"5px 12px",borderRadius:6,fontSize:11,fontWeight:600,cursor:token?"pointer":"not-allowed",flexShrink:0,
+              }}>Connect</button>
+            </div>
+          </div>
+          {/* Anthropic key */}
+          <div>
+            <p style={{margin:"0 0 5px",fontSize:9,fontWeight:700,color:"#7c3aed",textTransform:"uppercase",letterSpacing:"0.06em"}}>
+              Anthropic API Key <span style={{fontWeight:400,textTransform:"none",color:"var(--cx)"}}>(for Generate Names)</span>
+            </p>
+            <input type="password" value={claudeKey} onChange={e=>setClaudeKey(e.target.value)}
+              placeholder="sk-ant-api03-…"
+              style={{...iStyle,border:"0.5px solid rgba(124,58,237,0.35)"}}/>
+            <p style={{margin:"3px 0 0",fontSize:9,color:"var(--cx)"}}>
+              Get one at <span style={{color:"#7c3aed",cursor:"default"}}>console.anthropic.com → API Keys</span>
+            </p>
+          </div>
+        </div>
+      </div>}
+
+      <div style={{flex:1,display:"flex",overflow:"hidden"}}>
+
+        {/* ── Sidebar ── */}
+        <aside style={{width:196,background:"var(--bp)",borderRight:"0.5px solid var(--bmd)",
+          display:"flex",flexDirection:"column",flexShrink:0,overflowY:"auto"}}>
+
+          {/* Workspace */}
+          <div style={{padding:"10px 11px",borderBottom:"0.5px solid var(--bsm)"}}>
+            <p style={{margin:"0 0 4px",fontSize:9,fontWeight:700,color:"var(--cx)",textTransform:"uppercase",letterSpacing:"0.06em"}}>Workspace</p>
+            <select value={wsGid} onChange={e=>setWsGid(e.target.value)} disabled={workspaces.length===0}
+              style={{width:"100%",fontSize:11,padding:"5px 6px",borderRadius:5,boxSizing:"border-box",
+                border:"0.5px solid var(--bmd)",background:"var(--bp)",
+                color:workspaces.length===0?"var(--cx)":"var(--ct)"}}>
+              <option value="">— select —</option>
+              {workspaces.map(w=><option key={w.gid} value={w.gid}>{w.name}</option>)}
+            </select>
+          </div>
+
+          {/* Scope */}
+          <div style={{padding:"9px 11px",borderBottom:"0.5px solid var(--bsm)"}}>
+            <p style={{margin:"0 0 5px",fontSize:9,fontWeight:700,color:"var(--cx)",textTransform:"uppercase",letterSpacing:"0.06em"}}>Demo scope</p>
+            <div style={{display:"flex",gap:3}}>
+              {[["org","Company-wide"],["dept","Department"]].map(([v,l])=>(
+                <button key={v} onClick={()=>setMode(v)} style={{
+                  flex:1,fontSize:10,padding:"5px 0",borderRadius:5,cursor:"pointer",fontWeight:500,
+                  border:mode===v?"0.5px solid #6366f1":"0.5px solid var(--bmd)",
+                  background:mode===v?"#6366f1":"transparent",color:mode===v?"#fff":"var(--cs)"}}>
+                  {l}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Config */}
+          <div style={{padding:"9px 11px",borderBottom:"0.5px solid var(--bsm)",display:"flex",flexDirection:"column",gap:7}}>
+            {[["Company",company,setCompany,"Acme Corp"],["Industry",industry,setIndustry,"Healthcare"]].map(([l,v,s,ph])=>(
+              <div key={l}>
+                <p style={{margin:"0 0 3px",fontSize:9,color:"var(--cs)",fontWeight:500}}>{l}</p>
+                <input value={v} onChange={e=>s(e.target.value)} placeholder={ph} style={iStyle}/>
+              </div>
+            ))}
+            {mode==="dept"&&<div>
+              <p style={{margin:"0 0 3px",fontSize:9,color:"var(--cs)",fontWeight:500}}>Department</p>
+              <input value={dept} onChange={e=>setDept(e.target.value)} placeholder="Marketing" style={iStyle}/>
+            </div>}
+          </div>
+
+          {/* Actions */}
+          <div style={{padding:"9px 11px",borderBottom:"0.5px solid var(--bsm)",display:"flex",flexDirection:"column",gap:5}}>
+            <Btn label={phase==="fetching"?"⏳ Fetching…":"Fetch Content"} onClick={fetchData} disabled={!canFetch} bg="#374151"/>
+            <Btn label={phase==="generating"?"⏳ Generating…":"✨ Generate Names"} onClick={generateNames} disabled={!canGen} bg="#7c3aed"/>
+            <Btn label={phase==="applying"?"⏳ Applying…":"🚀 Apply Changes - All"} onClick={()=>applyChanges()} disabled={!canApply} bg="#059669"/>
+            <Btn label="Apply - Goals only" onClick={()=>applyChanges("goal")} disabled={!canApply} bg="#047857"/>
+            <Btn label="Apply - Projects only" onClick={()=>applyChanges("project")} disabled={!canApply} bg="#047857"/>
+            <Btn label="Apply - Portfolios only" onClick={()=>applyChanges("portfolio")} disabled={!canApply} bg="#047857"/>
+          </div>
+
+          {/* Progress */}
+          {busy&&prog.of>0&&<div style={{padding:"7px 11px",borderBottom:"0.5px solid var(--bsm)"}}>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"var(--cx)",marginBottom:3}}>
+              <span style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",flex:1}}>{prog.lbl}</span>
+              <span style={{flexShrink:0,marginLeft:5}}>{prog.n}/{prog.of}</span>
+            </div>
+            <div style={{height:2.5,background:"var(--bs)",borderRadius:2}}>
+              <div style={{height:"100%",borderRadius:2,background:"#6366f1",
+                width:`${prog.of?(prog.n/prog.of*100):0}%`,transition:"width 0.2s"}}/>
+            </div>
+          </div>}
+
+          {/* Log */}
+          <div style={{flex:1,padding:"9px 11px",overflowY:"auto",minHeight:60}}>
+            <p style={{margin:"0 0 4px",fontSize:9,fontWeight:700,color:"var(--cx)",textTransform:"uppercase",letterSpacing:"0.06em"}}>Log</p>
+            {log.length===0
+              ?<p style={{fontSize:9,color:"var(--cx)",fontStyle:"italic"}}>No activity yet</p>
+              :log.slice().reverse().slice(0,50).map((l,i)=>(
+                <p key={i} style={{fontSize:9,color:"var(--cx)",margin:"0 0 1px",lineHeight:1.5,fontFamily:"var(--fm)",wordBreak:"break-all"}}>{l}</p>
+              ))}
+          </div>
+        </aside>
+
+        {/* ── Tree ── */}
+        <main style={{flex:1,overflowY:"auto",padding:14}}>
+          {!hasData?(
+            <div style={{height:"100%",display:"flex",flexDirection:"column",alignItems:"center",
+              justifyContent:"center",gap:10,textAlign:"center",padding:40}}>
+              <div style={{width:50,height:50,borderRadius:14,background:"var(--bs)",
+                display:"flex",alignItems:"center",justifyContent:"center"}}>
+                <i className="ti ti-hierarchy-2" style={{fontSize:24,color:"var(--cx)"}}/>
+              </div>
+              <div>
+                <p style={{margin:"0 0 5px",fontSize:14,fontWeight:500,color:"var(--cs)"}}>No content loaded</p>
+                <p style={{margin:0,fontSize:11,color:"var(--cx)",maxWidth:260,lineHeight:1.6}}>
+                  {!token?"Open Settings → enter Asana token → Connect":
+                    !wsGid?"Select a workspace, then Fetch Content":
+                    "Click Fetch Content to load your demo environment"}
+                </p>
+              </div>
+            </div>
+          ):(
+            <div style={{maxWidth:920}}>
+              {/* Toolbar */}
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10,gap:8}}>
+                <div style={{display:"flex",gap:5}}>
+                  {[["Expand all",expandAll],["Collapse all",collapseAll]].map(([l,fn])=>(
+                    <button key={l} onClick={fn} style={{fontSize:9,padding:"3px 9px",borderRadius:5,
+                      cursor:"pointer",border:"0.5px solid var(--bmd)",background:"transparent",color:"var(--cs)"}}>
+                      {l}
+                    </button>
+                  ))}
+                </div>
+                <p style={{margin:0,fontSize:10,color:"var(--cx)"}}>
+                  {phase==="review"&&`${Object.keys(sugg).length} suggestions — edit inline then Apply`}
+                  {phase==="done"&&`Complete: ${nOK} updated${nFail?` · ${nFail} failed`:""}`}
+                  {phase==="fetched"&&(!claudeKey
+                    ?"Add your Anthropic API key in Settings to generate names"
+                    :"Fill in Company & Industry, then Generate Names")}
+                </p>
+              </div>
+
+              {/* Goals section */}
+              {gTree.length>0&&<div style={{background:"var(--bp)",border:"0.5px solid var(--bmd)",
+                borderRadius:pTree.length>0?"10px 10px 0 0":10,overflow:"hidden",
+                borderBottom:pTree.length>0?"none":undefined}}>
+                <div style={{display:"flex",alignItems:"center",gap:7,padding:"7px 11px",
+                  background:"rgba(245,158,11,0.05)",borderBottom:"0.5px solid rgba(245,158,11,0.18)"}}>
+                  <i className="ti ti-target" style={{fontSize:13,color:"#f59e0b"}}/>
+                  <span style={{fontSize:9,fontWeight:700,color:"#92400e",textTransform:"uppercase",letterSpacing:"0.06em"}}>Goals</span>
+                  <span style={{fontSize:9,color:"#b45309"}}>({nG})</span>
+                </div>
+                <ColHdr/>
+                {gTree.map(g=><Row key={g.gid} item={g} exp={exp} onToggle={onToggle}
+                  sugg={sugg} edits={edits} onEdit={onEdit} res={res}/>)}
+              </div>}
+
+              {/* Portfolios section */}
+              {pTree.length>0&&<div style={{background:"var(--bp)",border:"0.5px solid var(--bmd)",
+                borderRadius:gTree.length>0?"0 0 10px 10px":10,overflow:"hidden",
+                borderTop:gTree.length>0?"none":undefined}}>
+                <div style={{display:"flex",alignItems:"center",gap:7,padding:"7px 11px",
+                  background:"rgba(59,130,246,0.05)",borderBottom:"0.5px solid rgba(59,130,246,0.18)"}}>
+                  <i className="ti ti-folder" style={{fontSize:13,color:"#3b82f6"}}/>
+                  <span style={{fontSize:9,fontWeight:700,color:"#1e3a8a",textTransform:"uppercase",letterSpacing:"0.06em"}}>Portfolios &amp; Projects</span>
+                  <span style={{fontSize:9,color:"#1d4ed8"}}>({nP} portfolios · {nPr} items)</span>
+                </div>
+                <ColHdr/>
+                {pTree.map(p=><Row key={p.gid} item={p} exp={exp} onToggle={onToggle}
+                  sugg={sugg} edits={edits} onEdit={onEdit} res={res}/>)}
+              </div>}
+
+              {/* If fetched but empty */}
+              {hasData&&gTree.length===0&&pTree.length===0&&<div style={{
+                textAlign:"center",padding:"40px 20px",color:"var(--cx)",fontSize:12}}>
+                Data loaded but nothing to display — check the activity log for details.
+              </div>}
+            </div>
+          )}
+        </main>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
